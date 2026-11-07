@@ -17,7 +17,18 @@ on:
         required: false
         default: ''
         type: string
+      ksu_version:
+        description: 'override KSU_VERSION (e.g. 32718), empty to derive from git'
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
+    inputs:
+      ksu_version:
+        description: 'override KSU_VERSION (e.g. 32718), empty to derive from git'
+        required: false
+        default: ''
+        type: string
 jobs:
   build-lkm:
     strategy:
@@ -37,3 +48,4 @@ jobs:
       package_name: ${{ inputs.package_name || '' }}
       expected_size: ${{ inputs.expected_size || '' }}
       expected_hash: ${{ inputs.expected_hash || '' }}
+      ksu_version: ${{ inputs.ksu_version || '' }}

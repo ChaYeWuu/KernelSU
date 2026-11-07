@@ -156,7 +156,12 @@ endif
 # Calculate version if git version is available
 ifdef KSU_GIT_VERSION_VALID
 # ksu_version: major * 10000 + git version + 200 for historical reasons
+# Shallow clones report a bogus commit count, so allow the caller to pin it.
+ifdef KSU_VERSION_OVERRIDE
+$(eval KSU_VERSION=$(KSU_VERSION_OVERRIDE))
+else
 $(eval KSU_VERSION=$(shell expr 30000 + $(KSU_GIT_VERSION)))
+endif
 $(info -- KernelSU version: $(KSU_VERSION))
 ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
 else
