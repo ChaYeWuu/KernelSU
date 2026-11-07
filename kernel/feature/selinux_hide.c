@@ -165,12 +165,33 @@ static write_op_fn orig_context_write, orig_access_write;
 #define ksu_task_security_struct cred_security_struct
 #endif
 
+/* 检测器用 -EACCES(13) / -EINVAL(22) 区分「类型存在但转换不允许」和「类型不存在」。
+ * KSU 注入的类型不在备份策略里，回 -EINVAL 才是类型不存在时内核的真实回答。 */
+static int is_ksu_context(const char *buf, size_t size)
+{
+    size_t i;
+
+    if (!buf || size < 5)
+        return 0;
+    for (i = 0; i + 5 <= size; i++) {
+        if (buf[i] != ':')
+            continue;
+        if (buf[i + 1] != 'k' || buf[i + 2] != 's' || buf[i + 3] != 'u')
+            continue;
+        if (buf[i + 4] == ':' || buf[i + 4] == '_')
+            return 1;
+    }
+    return 0;
+}
+
 static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 {
     // apply to all app uids
     if (likely(current_uid().val < 10000)) {
         return orig_context_write(file, buf, size);
     }
+    if (is_ksu_context(buf, size))
+        return -EINVAL;
     char *canon = NULL;
     u32 sid, len;
     ssize_t length;
@@ -209,6 +230,8 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
     if (likely(current_uid().val < 10000)) {
         return orig_access_write(file, buf, size);
     }
+    if (is_ksu_context(buf, size))
+        return -EINVAL;
     char *scon = NULL, *tcon = NULL;
     u32 ssid, tsid, sconlen, tconlen;
     u16 tclass;
@@ -311,6 +334,9 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
     if (strcmp(name, "current")) {
         goto call_orig;
     }
+
+    if (size && ((char *)value)[0] && is_ksu_context(value, size))
+        return -EINVAL;
 
     struct ksu_task_security_struct *tsec;
     struct cred *new;
