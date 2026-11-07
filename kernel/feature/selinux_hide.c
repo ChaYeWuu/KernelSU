@@ -16,6 +16,8 @@
 #include <net/genetlink.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/kprobes.h>
+#include <linux/percpu.h>
 // security/selinux/include/security.h
 #include <security.h>
 #include <ss/context.h>
@@ -62,6 +64,77 @@ enum sel_inos {
 typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
 
 static write_op_fn *selinux_write_op;
+
+/*
+ * 有些厂商内核把 SELinux 的函数指针槽锁死了（玄戒、三星 KDP/RKP 都有这套），
+ * ksu_patch_text 写进去只会返回 -EFAULT。这类机器上改成在目标函数入口挂
+ * kprobe，pre_handler 把 PC 拨到 trampoline，一个字节都不碰那些槽。
+ *
+ * trampoline 里会再调原函数，原函数入口的同一个 kprobe 会二次命中，所以用
+ * 一个 per-cpu 深度计数挡住：已经在 trampoline 里就直接放行原指令。
+ */
+struct sel_hide_probe {
+    struct kprobe kp;
+    void *trampoline;
+    bool registered;
+};
+
+static DEFINE_PER_CPU(int, sel_hide_guard_depth);
+
+static bool sel_hide_guard_enter(void)
+{
+    int *depth = this_cpu_ptr(&sel_hide_guard_depth);
+
+    if (*depth)
+        return false;
+    (*depth)++;
+    return true;
+}
+
+static void sel_hide_guard_exit(void)
+{
+    this_cpu_dec(sel_hide_guard_depth);
+}
+
+static int sel_hide_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct sel_hide_probe *probe = container_of(p, struct sel_hide_probe, kp);
+
+    if (!sel_hide_guard_enter())
+        return 0;
+    instruction_pointer_set(regs, (unsigned long)probe->trampoline);
+    return 1;
+}
+
+/* 先用地址注册；个别内核不认地址，退回去用符号名。 */
+static int sel_hide_probe_register(struct sel_hide_probe *probe, void *target, const char *symbol)
+{
+    int ret;
+
+    if (!target)
+        return -ENOENT;
+    memset(&probe->kp, 0, sizeof(probe->kp));
+    probe->kp.pre_handler = sel_hide_pre_handler;
+    probe->kp.addr = (kprobe_opcode_t *)target;
+    ret = register_kprobe(&probe->kp);
+    if (ret && symbol) {
+        memset(&probe->kp, 0, sizeof(probe->kp));
+        probe->kp.pre_handler = sel_hide_pre_handler;
+        probe->kp.symbol_name = symbol;
+        ret = register_kprobe(&probe->kp);
+    }
+    if (!ret)
+        probe->registered = true;
+    return ret;
+}
+
+static void sel_hide_probe_unregister(struct sel_hide_probe *probe)
+{
+    if (!probe->registered)
+        return;
+    unregister_kprobe(&probe->kp);
+    probe->registered = false;
+}
 
 static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
                                                u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);
@@ -380,6 +453,43 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
     return ret;
 }
 
+static int __nocfi sel_hide_status_open_tramp(struct inode *inode, struct file *filp)
+{
+    int ret = my_sel_open_handle_status(inode, filp);
+
+    sel_hide_guard_exit();
+    return ret;
+}
+
+static ssize_t __nocfi sel_hide_write_context_tramp(struct file *file, char *buf, size_t size)
+{
+    ssize_t ret = my_write_context(file, buf, size);
+
+    sel_hide_guard_exit();
+    return ret;
+}
+
+static ssize_t __nocfi sel_hide_write_access_tramp(struct file *file, char *buf, size_t size)
+{
+    ssize_t ret = my_write_access(file, buf, size);
+
+    sel_hide_guard_exit();
+    return ret;
+}
+
+static int __nocfi sel_hide_setprocattr_tramp(const char *name, void *value, size_t size)
+{
+    int ret = my_setprocattr(name, value, size);
+
+    sel_hide_guard_exit();
+    return ret;
+}
+
+static struct sel_hide_probe status_open_probe = { .trampoline = sel_hide_status_open_tramp };
+static struct sel_hide_probe context_write_probe = { .trampoline = sel_hide_write_context_tramp };
+static struct sel_hide_probe access_write_probe = { .trampoline = sel_hide_write_access_tramp };
+static struct sel_hide_probe setprocattr_probe = { .trampoline = sel_hide_setprocattr_tramp };
+
 static void hook_selinux_status_open();
 static void ksu_selinux_hide_unhook();
 static int ksu_selinux_hide_enable()
@@ -412,8 +522,12 @@ static int ksu_selinux_hide_enable()
     orig_context_write = *context_write;
     ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
-        pr_err("selinux_hide: init: patch_text context_write err: %d\n", ret);
-        goto unhook;
+        pr_warn("selinux_hide: init: patch_text context_write err: %d, try kprobe\n", ret);
+        ret = sel_hide_probe_register(&context_write_probe, (void *)orig_context_write, "sel_write_context");
+        if (ret) {
+            pr_err("selinux_hide: init: kprobe context_write err: %d\n", ret);
+            goto unhook;
+        }
     }
 
     access_write = &selinux_write_op[SEL_ACCESS];
@@ -422,14 +536,29 @@ static int ksu_selinux_hide_enable()
     orig_access_write = *access_write;
     ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
-        pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
-        goto unhook;
+        pr_warn("selinux_hide: init: patch_text access_write err: %d, try kprobe\n", ret);
+        ret = sel_hide_probe_register(&access_write_probe, (void *)orig_access_write, "sel_write_access");
+        if (ret) {
+            pr_err("selinux_hide: init: kprobe access_write err: %d\n", ret);
+            goto unhook;
+        }
     }
 
     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
     if (ret) {
-        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
-        goto unhook;
+        pr_warn("selinux_hide: init: selinux_setprocattr_hook err: %d, try kprobe\n", ret);
+        void *target = find_kernel_symbol_exact("selinux_setprocattr");
+        if (!target) {
+            pr_err("selinux_hide: selinux_setprocattr not found\n");
+            goto unhook;
+        }
+        selinux_setprocattr_hook.original = target;
+        ret = sel_hide_probe_register(&setprocattr_probe, target, "selinux_setprocattr");
+        if (ret) {
+            pr_err("selinux_hide: init: kprobe selinux_setprocattr err: %d\n", ret);
+            selinux_setprocattr_hook.original = NULL;
+            goto unhook;
+        }
     }
 
     return 0;
@@ -442,7 +571,11 @@ unhook:
 static void ksu_selinux_hide_unhook()
 {
     int ret;
-    if (orig_context_write) {
+
+    if (context_write_probe.registered) {
+        sel_hide_probe_unregister(&context_write_probe);
+        orig_context_write = NULL;
+    } else if (orig_context_write) {
         ret =
             ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_context_write = NULL;
@@ -450,14 +583,20 @@ static void ksu_selinux_hide_unhook()
             pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
         }
     }
-    if (orig_access_write) {
+    if (access_write_probe.registered) {
+        sel_hide_probe_unregister(&access_write_probe);
+        orig_access_write = NULL;
+    } else if (orig_access_write) {
         ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_access_write = NULL;
         if (ret) {
             pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
         }
     }
-    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+    if (status_open_probe.registered) {
+        sel_hide_probe_unregister(&status_open_probe);
+        orig_sel_open_handle_status = NULL;
+    } else if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
         ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
                              sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
         orig_sel_open_handle_status = NULL;
@@ -465,7 +604,12 @@ static void ksu_selinux_hide_unhook()
             pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
         }
     }
-    ksu_lsm_unhook(&selinux_setprocattr_hook);
+    if (setprocattr_probe.registered) {
+        sel_hide_probe_unregister(&setprocattr_probe);
+        selinux_setprocattr_hook.original = NULL;
+    } else {
+        ksu_lsm_unhook(&selinux_setprocattr_hook);
+    }
 }
 
 static void ksu_selinux_hide_disable()
@@ -546,9 +690,14 @@ static void hook_selinux_status_open()
     orig_sel_open_handle_status = *sel_open_handle_status_slot;
     int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
-        pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\n", ret);
-        sel_open_handle_status_slot = NULL;
-        orig_sel_open_handle_status = NULL;
+        pr_warn("selinux_hide: init: patch_text sel_open_handle_status err: %d, try kprobe\n", ret);
+        ret = sel_hide_probe_register(&status_open_probe, (void *)orig_sel_open_handle_status,
+                                      "sel_open_handle_status");
+        if (ret) {
+            pr_err("selinux_hide: init: kprobe sel_open_handle_status err: %d\n", ret);
+            sel_open_handle_status_slot = NULL;
+            orig_sel_open_handle_status = NULL;
+        }
     }
 }
 
