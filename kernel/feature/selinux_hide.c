@@ -17,7 +17,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/kprobes.h>
-#include <linux/percpu.h>
+#include <linux/xarray.h>
 // security/selinux/include/security.h
 #include <security.h>
 #include <ss/context.h>
@@ -79,21 +79,26 @@ struct sel_hide_probe {
     bool registered;
 };
 
-static DEFINE_PER_CPU(int, sel_hide_guard_depth);
+/*
+ * Track recursion per task, not per CPU. my_write_context() may sleep in
+ * security_context_to_sid_with_policy() with GFP_KERNEL; if the task migrates
+ * while asleep, a per-CPU exit counter decrements the wrong CPU and leaves the
+ * original one permanently marked, silently disabling the redirect there.
+ */
+static DEFINE_XARRAY(sel_hide_guard_xa);
 
 static bool sel_hide_guard_enter(void)
 {
-    int *depth = this_cpu_ptr(&sel_hide_guard_depth);
+    unsigned long key = (unsigned long)current;
 
-    if (*depth)
+    if (xa_load(&sel_hide_guard_xa, key))
         return false;
-    (*depth)++;
-    return true;
+    return !xa_is_err(xa_store(&sel_hide_guard_xa, key, xa_mk_value(1), GFP_ATOMIC));
 }
 
 static void sel_hide_guard_exit(void)
 {
-    this_cpu_dec(sel_hide_guard_depth);
+    xa_erase(&sel_hide_guard_xa, (unsigned long)current);
 }
 
 static int sel_hide_pre_handler(struct kprobe *p, struct pt_regs *regs)
